@@ -18,6 +18,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { isToolCallEventType } from "@mariozechner/pi-coding-agent";
 import type { TextContent } from "@mariozechner/pi-ai";
+import { completeSimple } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { createHash } from "crypto";
 import { join } from "path";
@@ -223,21 +224,54 @@ export default function (pi: ExtensionAPI) {
 			const sessionMessages = collectSessionMessages(ctx);
 			if (sessionMessages.length === 0) return;
 
+			const model = ctx.model;
+			if (!model) {
+				console.error("[pi-recall] No model available for memory extraction.");
+				return;
+			}
+
+			const apiKey = await ctx.modelRegistry.getApiKey(model);
+			if (!apiKey) {
+				console.error("[pi-recall] No API key available for memory extraction.");
+				return;
+			}
+
 			// Get existing memories to avoid duplicates
 			const existing = store.list().map((m) => m.text);
 
-			// Use a simple completion function that the caller must provide
-			// For now, we skip extraction if no LLM is available via the context
-			// TODO: Wire up to the agent's model for extraction
-			// const extracted = await extractMemories(sessionMessages, completeFn, {
-			//   maxMemories: MAX_MEMORIES_PER_SESSION,
-			//   existingMemories: existing,
-			// });
+			const extracted = await extractMemories(
+				sessionMessages,
+				async (systemPrompt, userMessage) => {
+					const result = await completeSimple(model, {
+						systemPrompt,
+						messages: [{
+							role: "user" as const,
+							content: [{ type: "text" as const, text: userMessage }],
+							timestamp: Date.now(),
+						}],
+					}, { apiKey });
 
-			// For now, log that extraction would happen
-			console.error(
-				`[pi-recall] Session ended with ${sessionMessages.length} messages. Memory extraction not yet wired to LLM.`,
+					return result.content
+						.filter((c): c is TextContent => c.type === "text")
+						.map((c) => c.text)
+						.join("");
+				},
+				{
+					maxMemories: MAX_MEMORIES_PER_SESSION,
+					existingMemories: existing,
+				},
 			);
+
+			if (extracted.length === 0) return;
+
+			// Embed and store each extracted memory
+			const sessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}`;
+			for (const memory of extracted) {
+				const vec = await embedder.embed(memory.text);
+				store.add(memory.text, vec, sessionId);
+			}
+
+			console.error(`[pi-recall] Extracted and stored ${extracted.length} memories.`);
 		} catch (e) {
 			console.error("[pi-recall] Error during memory extraction:", e);
 		}
