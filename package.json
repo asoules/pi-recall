@@ -13,6 +13,9 @@
   "keywords": [
     "pi-package"
   ],
+  "pi": {
+    "extensions": ["./src/extension.ts"]
+  },
   "license": "MIT",
   "dependencies": {
     "@huggingface/transformers": "^3.8.1",
