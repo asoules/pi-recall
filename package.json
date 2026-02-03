@@ -1,0 +1,17 @@
+{
+  "name": "pi-recall",
+  "version": "0.1.0",
+  "description": "Long-term memory for the pi coding agent. Deja vu on read.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT"
+}
