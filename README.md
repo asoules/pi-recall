@@ -177,7 +177,6 @@ Constants in `src/extension.ts`:
 ## Known issues
 
 - Memory blocks appear in the read tool output in the UI. The agent sees them (which is the point) but they can be visually noisy. A future version may hide them from the UI while keeping them visible to the LLM.
-- A tree-sitter WASM cleanup crash (`mutex lock failed`) can occur on process exit. This is cosmetic and doesn't affect functionality.
 
 ## Development
 
