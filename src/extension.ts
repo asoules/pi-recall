@@ -35,6 +35,7 @@ import { extractMemories, type SessionMessage } from "./extractor.js";
 
 const RECALL_DIR = join(homedir(), ".pi-recall");
 const SIMILARITY_THRESHOLD = 0.3;
+const DEDUP_THRESHOLD = 0.9;
 const MAX_MEMORIES_PER_READ = 5;
 const MAX_MEMORIES_PER_SESSION = 20;
 
@@ -236,9 +237,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Get existing memories to avoid duplicates
-			const existing = store.list().map((m) => m.text);
-
 			const extracted = await extractMemories(
 				sessionMessages,
 				async (systemPrompt, userMessage) => {
@@ -256,22 +254,37 @@ export default function (pi: ExtensionAPI) {
 						.map((c) => c.text)
 						.join("");
 				},
-				{
-					maxMemories: MAX_MEMORIES_PER_SESSION,
-					existingMemories: existing,
-				},
+				{ maxMemories: MAX_MEMORIES_PER_SESSION },
 			);
 
 			if (extracted.length === 0) return;
 
-			// Embed and store each extracted memory
+			// Embed each extracted memory and deduplicate against existing store.
+			// If a new memory is too similar to an existing one (>0.9 cosine),
+			// it's a duplicate and we skip it.
 			const sessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}`;
+			let stored = 0;
+			let skipped = 0;
+
 			for (const memory of extracted) {
 				const vec = await embedder.embed(memory.text);
+
+				// Check for near-duplicates in the store
+				if (store.count() > 0) {
+					const dupes = store.search(vec, DEDUP_THRESHOLD, 1);
+					if (dupes.length > 0) {
+						skipped++;
+						continue;
+					}
+				}
+
 				store.add(memory.text, vec, sessionId);
+				stored++;
 			}
 
-			console.error(`[pi-recall] Extracted and stored ${extracted.length} memories.`);
+			console.error(
+				`[pi-recall] Extracted ${extracted.length} memories: stored ${stored}, skipped ${skipped} duplicates.`,
+			);
 		} catch (e) {
 			console.error("[pi-recall] Error during memory extraction:", e);
 		}
