@@ -293,6 +293,7 @@ async function ensureInit(): Promise<void> {
 	if (!parserInitialized) {
 		await Parser.init();
 		parserInitialized = true;
+		registerExitHandler();
 	}
 }
 
@@ -324,6 +325,29 @@ function getQuery(langKey: string, language: Language): Query {
 // ============================================================================
 // Public API
 // ============================================================================
+
+/**
+ * Clean up tree-sitter resources.
+ * Must be called before process exit to avoid WASM mutex crash.
+ */
+export function disposeSignatureExtractor(): void {
+	for (const query of compiledQueries.values()) {
+		query.delete();
+	}
+	compiledQueries.clear();
+	loadedLanguages.clear();
+	parserInitialized = false;
+}
+
+// Safety net: clean up on process exit to prevent WASM mutex crash
+let exitHandlerRegistered = false;
+function registerExitHandler(): void {
+	if (exitHandlerRegistered) return;
+	exitHandlerRegistered = true;
+	process.on("exit", () => {
+		disposeSignatureExtractor();
+	});
+}
 
 /**
  * Detect language from file extension.

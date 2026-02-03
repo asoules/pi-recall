@@ -24,9 +24,11 @@ import { createHash } from "crypto";
 import { join } from "path";
 import { homedir } from "os";
 
-import { createEmbedder, type Embedder } from "./embedder.js";
+import { createEmbedderProxy } from "./embedder-proxy.js";
+import type { Embedder } from "./embedder.js";
+
 import { MemoryStore } from "./store.js";
-import { extractSignature, detectLanguage } from "./signature.js";
+import { extractSignature, detectLanguage, disposeSignatureExtractor } from "./signature.js";
 import { extractMemories, type SessionMessage } from "./extractor.js";
 
 // ============================================================================
@@ -49,37 +51,37 @@ function projectHash(cwd: string): string {
 // ============================================================================
 
 export default function (pi: ExtensionAPI) {
-	let embedder: Embedder | null = null;
 	let store: MemoryStore | null = null;
+	let embedder: Embedder | null = null;
 	let cwd = "";
-	let initPromise: Promise<void> | null = null;
-	let initFailed = false;
+	let storeInitialized = false;
 
-	/** Lazy initialization — loads model and opens DB on first use */
-	async function ensureInit(): Promise<boolean> {
-		if (initFailed) return false;
-		if (embedder && store) return true;
+	/** Open the store (sqlite only, no native threads) */
+	function ensureStore(): boolean {
+		if (store) return true;
+		if (storeInitialized) return false; // previously failed
 
-		if (!initPromise) {
-			initPromise = (async () => {
-				try {
-					embedder = await createEmbedder();
-					const dbPath = join(RECALL_DIR, projectHash(cwd), "memories.db");
-					store = new MemoryStore({ dbPath });
-				} catch (e) {
-					initFailed = true;
-					console.error("[pi-recall] Failed to initialize:", e);
-					throw e;
-				}
-			})();
-		}
-
+		storeInitialized = true;
 		try {
-			await initPromise;
+			const dbPath = join(RECALL_DIR, projectHash(cwd), "memories.db");
+			store = new MemoryStore({ dbPath });
 			return true;
-		} catch {
+		} catch (e) {
+			console.error("[pi-recall] Failed to open store:", e);
 			return false;
 		}
+	}
+
+	/**
+	 * Get the shared embedder proxy (child process).
+	 * Lazy-created on first use, reused for the session.
+	 * Killed on session shutdown.
+	 */
+	async function getEmbedder(): Promise<Embedder> {
+		if (!embedder) {
+			embedder = await createEmbedderProxy();
+		}
+		return embedder;
 	}
 
 	// --------------------------------------------------------------------------
@@ -112,8 +114,7 @@ export default function (pi: ExtensionAPI) {
 		);
 		if (!textContent?.text) return;
 
-		const ready = await ensureInit();
-		if (!ready || !embedder || !store) return;
+		if (!ensureStore() || !store) return;
 
 		// Don't bother if store is empty
 		if (store.count() === 0) return;
@@ -124,7 +125,8 @@ export default function (pi: ExtensionAPI) {
 			if (!signature) return;
 
 			// Embed the signature and search for memories
-			const queryVec = await embedder.embed(signature);
+			const emb = await getEmbedder();
+			const queryVec = await emb.embed(signature);
 			const matches = store.search(queryVec, SIMILARITY_THRESHOLD, MAX_MEMORIES_PER_READ);
 
 			if (matches.length === 0) return;
@@ -166,8 +168,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			const ready = await ensureInit();
-			if (!ready || !embedder || !store) {
+			if (!ensureStore() || !store) {
 				return {
 					content: [{ type: "text" as const, text: "Memory system not initialized." }],
 					details: {},
@@ -184,7 +185,8 @@ export default function (pi: ExtensionAPI) {
 			const limit = params.limit ?? 10;
 
 			try {
-				const queryVec = await embedder.embed(params.query);
+				const emb = await getEmbedder();
+				const queryVec = await emb.embed(params.query);
 				const matches = store.search(queryVec, SIMILARITY_THRESHOLD, limit);
 
 				if (matches.length === 0) {
@@ -218,8 +220,7 @@ export default function (pi: ExtensionAPI) {
 	// --------------------------------------------------------------------------
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		const ready = await ensureInit();
-		if (!ready || !embedder || !store) return;
+		if (!ensureStore() || !store) return;
 
 		try {
 			const sessionMessages = collectSessionMessages(ctx);
@@ -259,17 +260,15 @@ export default function (pi: ExtensionAPI) {
 
 			if (extracted.length === 0) return;
 
-			// Embed each extracted memory and deduplicate against existing store.
-			// If a new memory is too similar to an existing one (>0.9 cosine),
-			// it's a duplicate and we skip it.
+			// Embed and store, deduplicating against existing memories
 			const sessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}`;
+			const emb = await getEmbedder();
 			let stored = 0;
 			let skipped = 0;
 
 			for (const memory of extracted) {
-				const vec = await embedder.embed(memory.text);
+				const vec = await emb.embed(memory.text);
 
-				// Check for near-duplicates in the store
 				if (store.count() > 0) {
 					const dupes = store.search(vec, DEDUP_THRESHOLD, 1);
 					if (dupes.length > 0) {
@@ -291,12 +290,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --------------------------------------------------------------------------
-	// Cleanup
+	// Cleanup: kill the embedder child process and close store
 	// --------------------------------------------------------------------------
 
 	pi.on("session_shutdown", async () => {
+		disposeSignatureExtractor();
 		if (embedder) {
-			await embedder.dispose();
+			await embedder.dispose(); // SIGKILL, instant
 			embedder = null;
 		}
 		if (store) {
@@ -312,8 +312,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("memories", {
 		description: "List all stored memories",
 		handler: async (_args, ctx) => {
-			const ready = await ensureInit();
-			if (!ready || !store) {
+			if (!ensureStore() || !store) {
 				ctx.ui.notify("Memory system not initialized", "error");
 				return;
 			}
@@ -340,8 +339,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const ready = await ensureInit();
-			if (!ready || !store) {
+			if (!ensureStore() || !store) {
 				ctx.ui.notify("Memory system not initialized", "error");
 				return;
 			}
@@ -359,15 +357,20 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const ready = await ensureInit();
-			if (!ready || !embedder || !store) {
+			if (!ensureStore() || !store) {
 				ctx.ui.notify("Memory system not initialized", "error");
 				return;
 			}
 
-			const vec = await embedder.embed(args);
-			const id = store.add(args, vec, "manual");
-			ctx.ui.notify(`Remembered (id: ${id}): ${args}`, "info");
+			try {
+				const emb = await getEmbedder();
+				const vec = await emb.embed(args);
+				const id = store.add(args, vec, "manual");
+				ctx.ui.notify(`Remembered (id: ${id}): ${args}`, "info");
+			} catch (e) {
+				ctx.ui.notify("Failed to embed memory", "error");
+				console.error("[pi-recall] Error in /remember:", e);
+			}
 		},
 	});
 }
