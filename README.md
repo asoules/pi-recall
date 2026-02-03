@@ -1,8 +1,23 @@
 # pi-recall
 
-Long-term memory for the pi coding agent.
+Long-term memory for the [pi coding agent](https://github.com/badlogic/pi-mono).
 
 When the agent reads a file, pi-recall triggers a "deja vu" moment: it extracts the file's structural signature (class names, module declarations, function signatures), searches a local vector database for semantically similar memories, and injects them into the read result. The agent just... remembers.
+
+## Install
+
+```bash
+cd ~/Code  # or wherever you keep projects
+git clone <this-repo> pi-recall
+cd pi-recall
+npm install
+
+# Symlink into pi's extension directory
+mkdir -p ~/.pi/agent/extensions
+ln -s $(pwd) ~/.pi/agent/extensions/pi-recall
+```
+
+That's it. Next time you start pi, the extension loads automatically.
 
 ## How it works
 
@@ -19,11 +34,11 @@ pi-recall gives the agent a persistent memory that surfaces automatically when r
 ```
 Session messages (not tool calls)
     ↓
-LLM extracts durable facts
+LLM extracts durable facts (using the agent's own model)
     ("the events table uses soft-deletes, never hard-delete")
     ("cascade deletes are disabled on event_attendees FK")
     ↓
-Embed each fact → store in sqlite-vec
+Embed each fact → deduplicate → store in sqlite-vec
 ```
 
 **Recalling memories** (on every file read):
@@ -38,8 +53,8 @@ Embed signature → query sqlite-vec (similarity threshold)
     ↓
 Matching memories appended to read result:
     <memory>
-    - never hard-delete from this table (2025-01-15)
-    - the updated_at trigger was added to fix audit gaps (2025-01-28)
+    - never hard-delete from this table
+    - the updated_at trigger was added to fix audit gaps
     </memory>
 ```
 
@@ -54,6 +69,26 @@ File contents are concrete. When the agent reads `schema/events.sql`, that's a p
 ### Why semantic, not path-based
 
 Files move, get renamed, get deleted. A memory keyed to `src/db/events.ts` breaks when the file becomes `src/models/event-repository.ts`. But a memory about "soft-delete logic for event records" matches against any file that talks about events and deletion, regardless of where it lives.
+
+## Usage
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `/remember <fact>` | Manually store a memory |
+| `/memories` | List all stored memories |
+| `/forget <id>` | Delete a memory by ID |
+
+### Agent tool
+
+The agent also has a `memory_search` tool it can use on its own when it wants to actively search for prior context (e.g., "let me check if there's anything about this...").
+
+### Automatic extraction
+
+When a session ends, pi-recall analyzes the conversation using the agent's current model and extracts durable facts — architectural decisions, corrections, conventions, gotchas, domain rules. These are embedded and stored automatically for future sessions.
+
+New memories are deduplicated at the embedding level: if a newly extracted fact is >0.9 cosine similarity to an existing memory, it's skipped.
 
 ## Signature extraction
 
@@ -79,23 +114,13 @@ TypeScript, TSX, JavaScript, Python, Ruby, Go, Rust, C, C++, Java, Swift, Dart, 
 | PHP | namespaces, classes, interfaces, traits, functions |
 | C# | namespaces, classes, interfaces, structs, enums, methods |
 
-### Two extraction modes
-
-**`extractSignature`** — compact, name-only:
-
-```
-src/events.ts | EventService | EventRepository | UserId | createUserService
-```
-
-**`extractSignatureLines`** — full declaration first lines:
-
-```
-src/events.ts | class EventService extends BaseService { | interface EventRepository {
-```
-
-Returns `null` for unsupported file types.
+Unsupported file types are silently skipped — no memory lookup occurs.
 
 ## Architecture
+
+### Storage
+
+Each project gets its own database, keyed by a hash of the working directory:
 
 ```
 ~/.pi-recall/
@@ -105,35 +130,61 @@ Returns `null` for unsupported file types.
 
 ### Components
 
-| Component | Status | Description |
-|-----------|--------|-------------|
-| **Signature extractor** | Done | Tree-sitter based, 14 languages |
-| **Embedder** | Stub | Local model (all-MiniLM-L6-v2 via ONNX) or API-based |
-| **Vector store** | Stub | sqlite-vec for storage and similarity search |
-| **Memory extractor** | Stub | LLM-based session analysis to extract durable facts |
-| **Read interceptor** | Not started | Hooks into the agent's `read` tool to inject memories |
-| **Memory search tool** | Not started | `memory_search(query)` for explicit agent-initiated recall |
+| Component | Description |
+|-----------|-------------|
+| **Signature extractor** | Tree-sitter WASM, 14 languages, extracts structural declarations |
+| **Embedder** | Local ONNX model (all-MiniLM-L6-v2), 384-dim, ~5ms/embed |
+| **Vector store** | better-sqlite3 + sqlite-vec, cosine similarity via L2 conversion |
+| **Memory extractor** | LLM-based session analysis, provider-agnostic |
+| **Extension** | pi extension that ties it all together |
 
 ### Memory retrieval paths
 
 ```
 sqlite-vec (single store)
-    ↑              ↑              ↑
-    |              |              |
-on read        on message     memory_search tool
-(deja vu)      (kung fu)      (explicit recall)
+    ↑                    ↑
+    |                    |
+on read              memory_search tool
+(deja vu)            (explicit recall)
 ```
 
-- **On read** (primary) — every `read` call triggers signature extraction, embedding, and memory lookup
-- **On message** (optional) — embed user message, inject top-k memories into system prompt
-- **Memory search** (explicit) — agent tool for deliberate recall when exploring unfamiliar code
+- **On read** (automatic) — every `read` of a supported file triggers signature extraction, embedding, and memory lookup
+- **Memory search** (explicit) — agent tool for deliberate recall
+
+### Performance
+
+| Operation | Time |
+|-----------|------|
+| Embedder cold start (first use per session) | ~150ms |
+| Embedding per text | ~5ms |
+| Signature extraction per file | ~5-30ms |
+| Vector search | <1ms |
+| Total overhead per `read` | ~10-35ms |
+
+The embedder initializes lazily on first `read` of a supported file. Subsequent reads in the same session reuse the cached model.
+
+## Configuration
+
+Constants in `src/extension.ts`:
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `SIMILARITY_THRESHOLD` | 0.3 | Minimum cosine similarity to surface a memory |
+| `DEDUP_THRESHOLD` | 0.9 | Above this, a new memory is considered a duplicate |
+| `MAX_MEMORIES_PER_READ` | 5 | Maximum memories injected per file read |
+| `MAX_MEMORIES_PER_SESSION` | 20 | Maximum memories extracted per session end |
+
+## Known issues
+
+- Memory blocks appear in the read tool output in the UI. The agent sees them (which is the point) but they can be visually noisy. A future version may hide them from the UI while keeping them visible to the LLM.
+- A tree-sitter WASM cleanup crash (`mutex lock failed`) can occur on process exit. This is cosmetic and doesn't affect functionality.
 
 ## Development
 
 ```bash
 npm install
 npm run check    # typecheck
-npm test         # run tests
+npm test         # run tests (45 tests across 5 suites)
 ```
 
 ## License
