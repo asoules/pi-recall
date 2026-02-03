@@ -21,7 +21,7 @@ import { Type } from "@sinclair/typebox";
 import { spawn } from "child_process";
 import { createHash } from "crypto";
 import { writeFileSync } from "fs";
-import { join, dirname } from "path";
+import { join, dirname, resolve } from "path";
 import { tmpdir, homedir } from "os";
 import { fileURLToPath } from "url";
 
@@ -42,9 +42,40 @@ const DEDUP_THRESHOLD = 0.9;
 const MAX_MEMORIES_PER_READ = 5;
 const MAX_MEMORIES_PER_SESSION = 20;
 
-/** Hash the cwd to create a project-specific database */
-function projectHash(cwd: string): string {
-	return createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+/** Hash a string to create a project-specific database directory name */
+function projectHash(identity: string): string {
+	return createHash("sha256").update(identity).digest("hex").slice(0, 12);
+}
+
+/**
+ * Resolve a stable identity for the git repository at `cwd`.
+ *
+ * Uses `git rev-parse --git-common-dir` which returns the same path
+ * for all worktrees of the same repo, making them share one memories.db.
+ *
+ * Falls back to `cwd` if not inside a git repository.
+ */
+export function getRepoIdentity(cwd: string): Promise<string> {
+	return new Promise((res) => {
+		const child = spawn("git", ["rev-parse", "--git-common-dir"], {
+			cwd,
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: 5000,
+		});
+		let stdout = "";
+		child.stdout.on("data", (data: Buffer) => { stdout += data.toString(); });
+		child.on("error", () => res(cwd));
+		child.on("close", (code) => {
+			if (code === 0 && stdout.trim()) {
+				const gitCommonDir = stdout.trim();
+				// resolve() handles both relative (".git") and absolute paths
+				const absPath = resolve(cwd, gitCommonDir);
+				res(absPath);
+			} else {
+				res(cwd);
+			}
+		});
+	});
 }
 
 // ============================================================================
@@ -55,6 +86,7 @@ export default function (pi: ExtensionAPI) {
 	let store: MemoryStore | null = null;
 	let embedder: Embedder | null = null;
 	let cwd = "";
+	let repoIdentity = "";
 	let storeInitialized = false;
 
 	/** Open the store (sqlite only, no native threads) */
@@ -64,7 +96,7 @@ export default function (pi: ExtensionAPI) {
 
 		storeInitialized = true;
 		try {
-			const dbPath = join(RECALL_DIR, projectHash(cwd), "memories.db");
+			const dbPath = join(RECALL_DIR, projectHash(repoIdentity || cwd), "memories.db");
 			store = new MemoryStore({ dbPath });
 			return true;
 		} catch (e) {
@@ -91,6 +123,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		cwd = ctx.cwd;
+		repoIdentity = await getRepoIdentity(cwd);
 	});
 
 	// --------------------------------------------------------------------------
@@ -237,7 +270,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const dbPath = join(RECALL_DIR, projectHash(cwd), "memories.db");
+			const dbPath = join(RECALL_DIR, projectHash(repoIdentity || cwd), "memories.db");
 			const sessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}`;
 
 			// Write payload to a temp file (session transcripts can be large)
