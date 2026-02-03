@@ -15,6 +15,7 @@
   ],
   "license": "MIT",
   "dependencies": {
+    "@huggingface/transformers": "^3.8.1",
     "@repomix/tree-sitter-wasms": "^0.1.16",
     "web-tree-sitter": "^0.26.5"
   },
