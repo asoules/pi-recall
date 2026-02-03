@@ -16,20 +16,21 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { isToolCallEventType } from "@mariozechner/pi-coding-agent";
 import type { TextContent } from "@mariozechner/pi-ai";
-import { completeSimple } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
+import { spawn } from "child_process";
 import { createHash } from "crypto";
-import { join } from "path";
-import { homedir } from "os";
+import { writeFileSync } from "fs";
+import { join, dirname } from "path";
+import { tmpdir, homedir } from "os";
+import { fileURLToPath } from "url";
 
 import { createEmbedderProxy } from "./embedder-proxy.js";
 import type { Embedder } from "./embedder.js";
 
 import { MemoryStore } from "./store.js";
 import { extractSignature, detectLanguage, disposeSignatureExtractor } from "./signature.js";
-import { extractMemories, type SessionMessage } from "./extractor.js";
+import type { SessionMessage } from "./extractor.js";
 
 // ============================================================================
 // Config
@@ -220,8 +221,6 @@ export default function (pi: ExtensionAPI) {
 	// --------------------------------------------------------------------------
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		if (!ensureStore() || !store) return;
-
 		try {
 			const sessionMessages = collectSessionMessages(ctx);
 			if (sessionMessages.length === 0) return;
@@ -238,54 +237,34 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const extracted = await extractMemories(
-				sessionMessages,
-				async (systemPrompt, userMessage) => {
-					const result = await completeSimple(model, {
-						systemPrompt,
-						messages: [{
-							role: "user" as const,
-							content: [{ type: "text" as const, text: userMessage }],
-							timestamp: Date.now(),
-						}],
-					}, { apiKey });
-
-					return result.content
-						.filter((c): c is TextContent => c.type === "text")
-						.map((c) => c.text)
-						.join("");
-				},
-				{ maxMemories: MAX_MEMORIES_PER_SESSION },
-			);
-
-			if (extracted.length === 0) return;
-
-			// Embed and store, deduplicating against existing memories
+			const dbPath = join(RECALL_DIR, projectHash(cwd), "memories.db");
 			const sessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}`;
-			const emb = await getEmbedder();
-			let stored = 0;
-			let skipped = 0;
 
-			for (const memory of extracted) {
-				const vec = await emb.embed(memory.text);
+			// Write payload to a temp file (session transcripts can be large)
+			const payloadPath = join(tmpdir(), `pi-recall-${Date.now()}.json`);
+			writeFileSync(payloadPath, JSON.stringify({
+				sessionMessages,
+				model,
+				apiKey,
+				dbPath,
+				sessionId,
+				maxMemories: MAX_MEMORIES_PER_SESSION,
+				dedupThreshold: DEDUP_THRESHOLD,
+			}));
 
-				if (store.count() > 0) {
-					const dupes = store.search(vec, DEDUP_THRESHOLD, 1);
-					if (dupes.length > 0) {
-						skipped++;
-						continue;
-					}
-				}
+			// Spawn detached extraction worker — pi exits immediately
+			const workerPath = join(dirname(fileURLToPath(import.meta.url)), "extraction-worker.ts");
+			const child = spawn(process.execPath, ["--import", "tsx", workerPath, payloadPath], {
+				detached: true,
+				stdio: "ignore",
+				cwd: dirname(workerPath),
+				env: process.env,
+			});
+			child.unref();
 
-				store.add(memory.text, vec, sessionId);
-				stored++;
-			}
-
-			console.error(
-				`[pi-recall] Extracted ${extracted.length} memories: stored ${stored}, skipped ${skipped} duplicates.`,
-			);
+			console.error("[pi-recall] Memory extraction spawned in background.");
 		} catch (e) {
-			console.error("[pi-recall] Error during memory extraction:", e);
+			console.error("[pi-recall] Error spawning memory extraction:", e);
 		}
 	});
 
